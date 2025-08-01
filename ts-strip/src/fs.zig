@@ -8,8 +8,14 @@ fn cstr(comptime static_string: anytype) CStr {
     return static_string[0..static_string.len :0];
 }
 
-const FsPath = []const CStr;
-const INDEX_NOT_FOUND: usize = std.math.maxInt(usize);
+pub const FsPath = []const CStr;
+fn fsPathTotalLength(path: FsPath) usize {
+    var sum: usize = 0;
+    for (path) |segment| {
+        sum += segment.len;
+    }
+    return sum;
+}
 
 pub const FsError = error{ OutOfMemory, InvalidPath, IOError };
 
@@ -24,6 +30,14 @@ pub const File = struct {
         return self.fs.realpath(self);
     }
 
+    pub fn toString(self: *File) []const u8 {
+        return self.fs.toString(self.*);
+    }
+
+    pub fn close(self: *File) void {
+        self.fs.close(self);
+    }
+
     pub fn writeAll(self: *File, content: []const u8) FsError!void {
         return self.fs.writeAll(self, content);
     }
@@ -34,12 +48,12 @@ pub const File = struct {
 };
 
 pub const FileSystem = union(enum) {
-    Virtual: *VirtFs,
+    Virtual: *VirtualFs,
     Real: *RealFs,
 
     pub fn ofVirtual(alloc: std.mem.Allocator) !FileSystem {
-        const virtual_fs = try alloc.create(VirtFs);
-        virtual_fs.* = VirtFs.init(alloc);
+        const virtual_fs = try alloc.create(VirtualFs);
+        virtual_fs.* = try VirtualFs.init(alloc);
         return .{ .Virtual = virtual_fs };
     }
 
@@ -76,13 +90,19 @@ pub const FileSystem = union(enum) {
         }
     }
 
+    pub fn close(self: *FileSystem, file: File) void {
+        switch (self.*) {
+            inline else => |fs| fs.close(file),
+        }
+    }
+
     pub fn open(self: *FileSystem, file_path: FsPath) FsError!File {
         switch (self.*) {
             inline else => |fs| fs.open(file_path),
         }
     }
 
-    pub fn create(self: *FileSystem, file_path: FsPath) void!FsError {
+    pub fn create(self: *FileSystem, file_path: FsPath) FsError!void {
         switch (self.*) {
             inline else => |fs| fs.create(file_path),
         }
@@ -105,9 +125,15 @@ pub const FileSystem = union(enum) {
             inline else => |fs| return fs.resolveRelative(context, appendix),
         }
     }
+
+    pub fn toString(self: *FileSystem, file: File) []const u8 {
+        switch (self.*) {
+            inline else => |fs| return fs.toString(file),
+        }
+    }
 };
 
-pub const VirtFs = struct {
+pub const VirtualFs = struct {
     const FileId = usize;
 
     arena: std.heap.ArenaAllocator,
@@ -115,8 +141,9 @@ pub const VirtFs = struct {
 
     // metadata-like fields
     opened_file_paths: std.AutoHashMapUnmanaged(FileId, FsPath),
+    to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayListUnmanaged(u8)),
 
-    pub fn init(allocator: std.mem.Allocator) !VirtFs {
+    pub fn init(allocator: std.mem.Allocator) !VirtualFs {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const arena_allocator = arena.allocator();
 
@@ -125,17 +152,16 @@ pub const VirtFs = struct {
         disk.* = .{ .Dir = .{ .name = "@ROOT", .children = root_entries, .parent = null } };
 
         const opened_file_paths: std.AutoHashMapUnmanaged(FileId, FsPath) = .empty;
+        const to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayListUnmanaged(u8)) = .empty;
 
-        const result = VirtFs{ .arena = arena, .disk = disk, .opened_file_paths = opened_file_paths };
-
-        return result;
+        return .{ .arena = arena, .disk = disk, .opened_file_paths = opened_file_paths, .to_string_cache = to_string_cache };
     }
 
-    pub fn deinit(self: *VirtFs) void {
+    pub fn deinit(self: *VirtualFs) void {
         self.arena.deinit();
     }
 
-    pub fn open(self: *VirtFs, file_path: FsPath) FsError!File {
+    pub fn open(self: *VirtualFs, file_path: FsPath) FsError!File {
         const file_node = try self.disk.resolvePath(file_path);
 
         // If we find the entry we wanna own the path
@@ -154,7 +180,7 @@ pub const VirtFs = struct {
         return file;
     }
 
-    pub fn writeAll(self: *VirtFs, file: File, content: []const u8) FsError!void {
+    pub fn writeAll(self: *VirtualFs, file: File, content: []const u8) FsError!void {
         const fs_node = self.resolveFile(file) catch |e| {
             std.log.debug("Unable to resolve file to writeAll call, file may have been deleted", .{});
             return e;
@@ -168,7 +194,7 @@ pub const VirtFs = struct {
         };
     }
 
-    pub fn readAll(self: *VirtFs, file: File, alloc: std.mem.Allocator) FsError![]u8 {
+    pub fn readAll(self: *VirtualFs, file: File, alloc: std.mem.Allocator) FsError![]u8 {
         const fs_node = self.resolveFile(file) catch |e| {
             std.log.debug("Unable to resolve file to readAll call, file may have been deleted", .{});
             return e;
@@ -190,13 +216,13 @@ pub const VirtFs = struct {
         return buf;
     }
 
-    pub fn close(self: *VirtFs, file: File) void {
+    pub fn close(self: *VirtualFs, file: File) void {
         if (!self.opened_file_paths.swapRemove(file.id)) {
             @panic("VirtFs#close called on a already closed or not opened file");
         }
     }
 
-    pub fn realpath(self: *VirtFs, file: File) FsError!FsPath {
+    pub fn realpath(self: *VirtualFs, file: File) FsError!FsPath {
         if (self.opened_file_paths.get(file.id)) |fs_path| {
             return fs_path;
         } else {
@@ -204,14 +230,44 @@ pub const VirtFs = struct {
         }
     }
 
+    pub fn toString(self: *VirtualFs, file: File) []const u8 {
+        if (self.to_string_cache.get(file.id)) |to_string_cached| {
+            return to_string_cached.items;
+        }
+        const allocator = self.arena.allocator();
+        const path = self.realpath(file) catch {
+            std.log.err("Cannot get .toString() of File(id={d}). Either deleted or not opened", .{file.id});
+            return "FILE_GONE";
+        };
+
+        const buffer_size = fsPathTotalLength(path) + path.len;
+        var buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, buffer_size) catch {
+            std.log.err("Unable to allocate memory for File.toString() buffer", .{});
+            return "FILE_GONE";
+        };
+
+        for (path) |segment| {
+            // SAFETY: we pre-allocated the buffer with enough space
+            buf.append(allocator, '/') catch unreachable;
+            buf.appendSlice(allocator, segment) catch unreachable;
+        }
+        std.debug.assert(buffer_size == buf.items.len);
+
+        self.to_string_cache.put(allocator, file.id, buf) catch {
+            std.log.err("Unable to cache File.toString() result", .{});
+            return buf.items;
+        };
+        return buf.items;
+    }
+
     // resolveRelative /home/foo/Pictures Cat.jpg => VirtualFsNode {/home/foo/Pictures/Cat.jpg}
     // NOTE: context must be absolute path
-    pub fn resolveRelative(self: *VirtFs, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
+    pub fn resolveRelative(self: *VirtualFs, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
         const prefix = try self.disk.resolvePath(context);
         return try prefix.resolvePath(appendix);
     }
 
-    pub fn create(self: *VirtFs, path: FsPath) FsError!void {
+    pub fn create(self: *VirtualFs, path: FsPath) FsError!void {
         const file_name = path[path.len - 1];
         const file_parent_path = path[0 .. path.len - 1];
         std.log.debug("VirtFs#create: name={s} path={s}", .{ file_name, file_parent_path });
@@ -228,7 +284,9 @@ pub const VirtFs = struct {
         try parent_dir.Dir.children.append(allocator, file_entry);
     }
 
-    pub fn rm(self: *VirtFs, file_path: []const CStr) FsError!void {
+    pub fn rm(self: *VirtualFs, file_path: []const CStr) FsError!void {
+        const INDEX_NOT_FOUND: usize = std.math.maxInt(usize);
+
         const name = file_path[file_path.len - 1];
         const path = file_path[0 .. file_path.len - 1];
         std.log.debug("VirtFs#rm: name={s} path={s}", .{ name, path });
@@ -258,7 +316,7 @@ pub const VirtFs = struct {
         self.arena.allocator().destroy(file_node);
     }
 
-    pub fn mkDir(self: *VirtFs, path_segments: []const CStr) FsError!void {
+    pub fn mkDir(self: *VirtualFs, path_segments: []const CStr) FsError!void {
         const allocator = self.arena.allocator();
 
         const name = path_segments[path_segments.len - 1];
@@ -274,13 +332,13 @@ pub const VirtFs = struct {
         try parent_dir.Dir.children.append(allocator, new_dir_entry);
     }
 
-    pub fn stat(self: *VirtFs) VirtualFsStats {
+    pub fn stat(self: *VirtualFs) VirtualFsStats {
         const opened_file_count = self.opened_file_paths.count();
         const allocated_file_count = self.disk.fileCount();
         return .{ .opened_files_count = opened_file_count, .allocated_file_count = allocated_file_count };
     }
 
-    fn resolveFile(self: *VirtFs, file: File) FsError!*VirtualFsNode {
+    fn resolveFile(self: *VirtualFs, file: File) FsError!*VirtualFsNode {
         const node_path: FsPath = try self.realpath(file);
         const fs_node = self.disk.resolvePath(node_path) catch unreachable;
         return fs_node;
@@ -410,6 +468,18 @@ const RealFs = struct {
         @panic("Not implemented");
     }
 
+    pub fn close(self: *RealFs, file: File) void {
+        _ = self;
+        _ = file;
+        @panic("Not implemented");
+    }
+
+    pub fn toString(self: *RealFs, file: File) []const u8 {
+        _ = self;
+        _ = file;
+        @panic("Not implemented");
+    }
+
     pub fn resolveRelative(self: *RealFs, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
         _ = self;
         _ = context;
@@ -444,7 +514,7 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     t.register(@src());
     // t.setLogLevel(.debug);
 
-    var fs: VirtFs = try .init(t.allocator);
+    var fs: VirtualFs = try .init(t.allocator);
     defer fs.deinit();
 
     try fs.mkDir(&[_]CStr{cstr("home")});
@@ -487,7 +557,7 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     // FsPath: /home/dawid/notes.txt
     // Read/Write checks
     try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("notes.txt") });
-    const notes_file = try fs.open(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("notes.txt") });
+    var notes_file = try fs.open(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("notes.txt") });
     try fs.writeAll(notes_file, "1. Ship the project\n");
     const notes_content1 = try fs.readAll(notes_file, t.allocator);
     defer t.allocator.free(notes_content1);
@@ -497,4 +567,7 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     const notes_content2 = try fs.readAll(notes_file, t.allocator);
     defer t.allocator.free(notes_content2);
     try t.strEq("Should read the content of notes.txt again", notes_content2, notes_content1);
+
+    // toString check
+    try t.strEq("toString() should render as expected", notes_file.toString(), "/home/dawid/notes.txt");
 }
