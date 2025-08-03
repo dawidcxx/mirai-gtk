@@ -75,6 +75,24 @@ pub fn sliceEq(t: Testing, msg: []const u8, slice1: anytype, slice2: @TypeOf(sli
     logTestPass(msg);
 }
 
+pub fn isTrue(t: Testing, msg: []const u8, condition: bool) anyerror!void {
+    _ = t;
+    std.testing.expect(condition) catch |e| {
+        logTestFail(msg);
+        return e;
+    };
+    logTestPass(msg);
+}
+
+pub fn isFalse(t: Testing, msg: []const u8, condition: bool) anyerror!void {
+    _ = t;
+    std.testing.expect(!condition) catch |e| {
+        logTestFail(msg);
+        return e;
+    };
+    logTestPass(msg);
+}
+
 fn logTestPass(msg: []const u8) void {
     const target_width = 65;
     if (msg.len < target_width) {
