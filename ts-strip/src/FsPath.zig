@@ -1,6 +1,10 @@
 const std = @import("std");
 const Testing = @import("./testing.zig");
 
+/// FsPath is a structured representation of a filesystem path
+/// For example:
+///  `{ segments: ["usr", "local", "bin"], absolute: true }` => `/usr/local/bin`
+/// Use `FsPath.static` or `FsPath.Builder` to create instances
 segments: []const Segment,
 absolute: bool,
 
@@ -8,17 +12,24 @@ pub const FsPath = @This();
 pub const Segment = []const u8;
 pub const empty: FsPath = .{ .segments = &[_]FsPath.Segment{}, .absolute = false };
 
-pub fn parent_dir(path: FsPath) FsPath {
+pub fn parentDir(path: FsPath) FsPath {
     const all_but_last = path.segments[0 .. path.segments.len - 1];
     return .{ .segments = all_but_last, .absolute = path.absolute };
 }
 
-pub fn basename(path: FsPath) [:0]const u8 {
-    const terminal = path.segments[path.segments.len - 1];
-    var buf: [std.posix.NAME_MAX:0]u8 = undefined;
-    @memcpy(buf[0..terminal.len], terminal);
-    buf[terminal.len] = 0;
-    return buf[0..terminal.len :0];
+pub fn basename(path: FsPath) error{InvalidPath}!Segment {
+    if (path.segments.len == 0) {
+        return error.InvalidPath;
+    }
+    return path.segments[path.segments.len - 1];
+}
+
+pub fn isAbsolute(path: FsPath) bool {
+    return path.absolute;
+}
+
+pub fn isRelative(path: FsPath) bool {
+    return !path.absolute;
 }
 
 pub fn toString(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
@@ -34,7 +45,11 @@ pub fn toStringZ(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}!
     return buf;
 }
 
-pub fn fromStaticString(comptime path: []const u8) FsPath {
+pub fn deinit(self: FsPath, alloc: std.mem.Allocator) void {
+    alloc.free(self.segments);
+}
+
+pub fn static(comptime path: []const u8) FsPath {
     const segments = comptime blk: {
         // Count non-empty segments first
         var segment_count: usize = 0;
@@ -74,25 +89,46 @@ pub fn fromStaticString(comptime path: []const u8) FsPath {
     return .{ .segments = &segments, .absolute = is_absolute };
 }
 
-pub fn clone(path: FsPath, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
-    const segments_copy = try alloc.dupe(FsPath.Segment, path.segments);
-    return .{
-        .segments = segments_copy,
-        .absolute = path.absolute,
-    };
-}
+pub const Builder = struct {
+    segments: std.ArrayListUnmanaged(Segment),
+    backward_mode: bool,
 
-pub fn isAbsolute(path: FsPath) bool {
-    return path.absolute;
-}
+    pub fn initForward(alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!Builder {
+        var segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
+        try segments.append(alloc, segment);
+        return .{
+            .segments = segments,
+            .backward_mode = false,
+        };
+    }
 
-pub fn isRelative(path: FsPath) bool {
-    return !path.absolute;
-}
+    pub fn initBackward(alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!Builder {
+        var segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
+        try segments.append(alloc, segment);
+        return .{
+            .segments = segments,
+            .backward_mode = true,
+        };
+    }
+
+    pub fn push(self: *Builder, alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!void {
+        try self.segments.append(alloc, segment);
+    }
+
+    pub fn build_absolute(self: *Builder, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        const segments_owned = try self.segments.toOwnedSlice(alloc);
+        if (self.backward_mode) {
+            std.mem.reverse(Segment, segments_owned);
+        }
+        return .{
+            .absolute = true,
+            .segments = segments_owned,
+        };
+    }
+};
 
 // private utility fns
-
-fn countSegmentLength(path: FsPath) usize {
+inline fn countSegmentLength(path: FsPath) usize {
     var sum: usize = 0;
     for (path.segments) |segment| sum += segment.len;
     return sum;
@@ -115,17 +151,17 @@ inline fn fmtPath(path: FsPath, buf: []u8) void {
 }
 
 // tests
-
 test "run fromStaticString checks" {
-    try Testing.run(fromStaticStringAbsoluteChecks);
-    try Testing.run(fromStaticStringRelativeChecks);
+    try Testing.run(validateAbsolutePaths);
+    try Testing.run(validateRelativePaths);
+    try Testing.run(validateRuntimePaths);
 }
 
-fn fromStaticStringAbsoluteChecks(t: *Testing) anyerror!void {
+fn validateAbsolutePaths(t: *Testing) anyerror!void {
     t.register(@src());
     const alloc = t.allocator;
 
-    const path = FsPath.fromStaticString("/usr/local/bin");
+    const path = FsPath.static("/usr/local/bin");
 
     try t.isTrue("Path should be absolute", path.isAbsolute());
     try t.strEq("First segment should be usr", path.segments[0], "usr");
@@ -137,11 +173,11 @@ fn fromStaticStringAbsoluteChecks(t: *Testing) anyerror!void {
     try t.strEq("Should render the path to a string correctly", path_str, "/usr/local/bin");
 }
 
-fn fromStaticStringRelativeChecks(t: *Testing) anyerror!void {
+fn validateRelativePaths(t: *Testing) anyerror!void {
     t.register(@src());
     const alloc = t.allocator;
 
-    const path = FsPath.fromStaticString(".config/nvim/init.lua");
+    const path = FsPath.static(".config/nvim/init.lua");
 
     try t.isTrue("Path should be relative", path.isRelative());
     try t.strEq("First segment should be .config", path.segments[0], ".config");
@@ -151,4 +187,20 @@ fn fromStaticStringRelativeChecks(t: *Testing) anyerror!void {
     const path_str = try path.toStringZ(alloc);
     defer alloc.free(path_str);
     try t.strEq("Should render the path to a string correctly", path_str, ".config/nvim/init.lua");
+}
+
+fn validateRuntimePaths(t: *Testing) anyerror!void {
+    t.register(@src());
+    const alloc = t.allocator;
+
+    var builder = try FsPath.Builder.initBackward(alloc, "notes.txt");
+    try builder.push(alloc, "dawid");
+    try builder.push(alloc, "home");
+
+    const path = try builder.build_absolute(alloc);
+    defer path.deinit(alloc);
+
+    const path_str = try path.toString(alloc);
+    defer alloc.free(path_str);
+    try t.strEq("FsPath#Builder should construct the path as expected", path_str, "/home/dawid/notes.txt");
 }
