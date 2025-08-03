@@ -3,19 +3,109 @@ const posix = @import("std").posix;
 const builtin = @import("builtin");
 const Testing = @import("./testing.zig");
 
-const CStr = [:0]const u8;
-fn cstr(comptime static_string: anytype) CStr {
-    return static_string[0..static_string.len :0];
-}
+pub const FsPath = struct {
+    pub const Segment = []const u8;
+    pub const empty: FsPath = .{ .segments = &[_]FsPath.Segment{}, .absolute = false };
 
-pub const FsPath = []const CStr;
-fn fsPathTotalLength(path: FsPath) usize {
-    var sum: usize = 0;
-    for (path) |segment| {
-        sum += segment.len;
+    segments: []const Segment,
+    absolute: bool,
+
+    pub fn parent_dir(path: FsPath) FsPath {
+        const all_but_last = path.segments[0 .. path.segments.len - 1];
+        return .{ .segments = all_but_last, .absolute = path.absolute };
     }
-    return sum;
-}
+
+    pub fn basename(path: FsPath) [:0]const u8 {
+        const terminal = path.segments[path.segments.len - 1];
+        var buf: [std.posix.NAME_MAX:0]u8 = undefined;
+        @memcpy(buf[0..terminal.len], terminal);
+        buf[terminal.len] = 0;
+        return buf[0..terminal.len :0];
+    }
+
+    pub fn toString(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        const length = countSegmentLength(self) + self.segments.len;
+        const buf = try allocator.alloc(u8, length);
+        for (self.segments, 0..) |segment, i| {
+            // SAFETY: we pre-allocated the buffer with enough space
+            buf[i] = '/';
+            for (segment, 0..) |char, j| {
+                buf[i + 1 + j] = char;
+            }
+        }
+        return buf;
+    }
+
+    pub fn toStringZ(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
+        const length = countSegmentLength(self) + self.segments.len + 1;
+        const buf = try allocator.alloc(u8, length);
+        for (self.segments, 0..) |segment, i| {
+            // SAFETY: we pre-allocated the buffer with enough space
+            buf[i] = '/';
+            for (segment, 0..) |char, j| {
+                buf[i + 1 + j] = char;
+            }
+        }
+        buf[length - 1] = 0; // Null-terminate
+        return buf;
+    }
+
+    pub fn fromStaticString(comptime path: []const u8) FsPath {
+        const segments = comptime blk: {
+            // Count non-empty segments first
+            var segment_count: usize = 0;
+            var it = std.mem.splitScalar(u8, path, '/');
+
+            while (it.next()) |segment| {
+                if (segment.len == 0) { // empty segment
+                    if (segment_count == 0) { // legal if it's the first segment
+                        continue;
+                    } else {
+                        @compileError("FsPath#fromStaticString: Illegal empty segment detected");
+                    }
+                }
+                segment_count += 1;
+            }
+
+            // Create the result array with exact size
+            var segments: [segment_count][]const u8 = undefined;
+            var count: usize = 0;
+            it = std.mem.splitScalar(u8, path, '/');
+            while (it.next()) |segment| {
+                if (segment.len > 0) {
+                    segments[count] = segment;
+                    count += 1;
+                }
+            }
+
+            break :blk segments;
+        };
+        const is_absolute = comptime blk: {
+            if (path.len > 0 and path[0] == '/') {
+                break :blk true;
+            } else {
+                break :blk false;
+            }
+        };
+        return .{ .segments = &segments, .absolute = is_absolute };
+    }
+
+    pub fn clone(path: FsPath, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        const segments_copy = try alloc.dupe(FsPath.Segment, path.segments);
+        return .{
+            .segments = segments_copy,
+            .absolute = path.absolute,
+        };
+    }
+
+    fn countSegmentLength(path: FsPath) usize {
+        var sum: usize = 0;
+        for (path.segments) |segment| {
+            sum += segment.len;
+        }
+        return sum;
+    }
+};
 
 pub const FsError = error{ OutOfMemory, InvalidPath, IOError };
 
@@ -141,7 +231,7 @@ pub const VirtualFs = struct {
 
     // metadata-like fields
     opened_file_paths: std.AutoHashMapUnmanaged(FileId, FsPath),
-    to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayListUnmanaged(u8)),
+    to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, []const u8),
 
     pub fn init(allocator: std.mem.Allocator) !VirtualFs {
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -152,7 +242,7 @@ pub const VirtualFs = struct {
         disk.* = .{ .Dir = .{ .name = "@ROOT", .children = root_entries, .parent = null } };
 
         const opened_file_paths: std.AutoHashMapUnmanaged(FileId, FsPath) = .empty;
-        const to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, std.ArrayListUnmanaged(u8)) = .empty;
+        const to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, []const u8) = .empty;
 
         return .{ .arena = arena, .disk = disk, .opened_file_paths = opened_file_paths, .to_string_cache = to_string_cache };
     }
@@ -167,7 +257,7 @@ pub const VirtualFs = struct {
         // If we find the entry we wanna own the path
         // to avoid any potential memory complications
         const alloc = self.arena.allocator();
-        const file_path_owned = try alloc.dupe(CStr, file_path);
+        const file_path_owned = try file_path.clone(alloc);
 
         // (ab)using the address as the ID
         const file_id: usize = @intFromPtr(file_node);
@@ -232,32 +322,22 @@ pub const VirtualFs = struct {
 
     pub fn toString(self: *VirtualFs, file: File) []const u8 {
         if (self.to_string_cache.get(file.id)) |to_string_cached| {
-            return to_string_cached.items;
+            return to_string_cached;
         }
-        const allocator = self.arena.allocator();
         const path = self.realpath(file) catch {
-            std.log.err("Cannot get .toString() of File(id={d}). Either deleted or not opened", .{file.id});
+            std.log.err("VirtuaFs#toString unable to resolve File(id='{d}') real path", .{file.id});
             return "FILE_GONE";
         };
-
-        const buffer_size = fsPathTotalLength(path) + path.len;
-        var buf = std.ArrayListUnmanaged(u8).initCapacity(allocator, buffer_size) catch {
-            std.log.err("Unable to allocate memory for File.toString() buffer", .{});
+        const allocator = self.arena.allocator();
+        const result = path.toString(allocator) catch {
+            std.log.err("VirtuaFs#toString not enough memory to format string", .{});
             return "FILE_GONE";
         };
-
-        for (path) |segment| {
-            // SAFETY: we pre-allocated the buffer with enough space
-            buf.append(allocator, '/') catch unreachable;
-            buf.appendSlice(allocator, segment) catch unreachable;
-        }
-        std.debug.assert(buffer_size == buf.items.len);
-
-        self.to_string_cache.put(allocator, file.id, buf) catch {
-            std.log.err("Unable to cache File.toString() result", .{});
-            return buf.items;
+        self.to_string_cache.put(allocator, file.id, result) catch {
+            std.log.err("VirtuaFs#toString not enough memory to cache string", .{});
+            return result;
         };
-        return buf.items;
+        return result;
     }
 
     // resolveRelative /home/foo/Pictures Cat.jpg => VirtualFsNode {/home/foo/Pictures/Cat.jpg}
@@ -268,9 +348,8 @@ pub const VirtualFs = struct {
     }
 
     pub fn create(self: *VirtualFs, path: FsPath) FsError!void {
-        const file_name = path[path.len - 1];
-        const file_parent_path = path[0 .. path.len - 1];
-        std.log.debug("VirtFs#create: name={s} path={s}", .{ file_name, file_parent_path });
+        const file_name = path.basename();
+        const file_parent_path = path.parent_dir();
 
         const parent_dir = try self.disk.resolvePath(file_parent_path);
 
@@ -284,7 +363,7 @@ pub const VirtualFs = struct {
         try parent_dir.Dir.children.append(allocator, file_entry);
     }
 
-    pub fn rm(self: *VirtualFs, file_path: []const CStr) FsError!void {
+    pub fn rm(self: *VirtualFs, file_path: []const FsPath.Segment) FsError!void {
         const INDEX_NOT_FOUND: usize = std.math.maxInt(usize);
 
         const name = file_path[file_path.len - 1];
@@ -316,12 +395,20 @@ pub const VirtualFs = struct {
         self.arena.allocator().destroy(file_node);
     }
 
-    pub fn mkDir(self: *VirtualFs, path_segments: []const CStr) FsError!void {
+    pub fn mkDir(self: *VirtualFs, path_segments: FsPath) FsError!void {
         const allocator = self.arena.allocator();
 
-        const name = path_segments[path_segments.len - 1];
-        const path = path_segments[0 .. path_segments.len - 1];
-        std.log.debug("VirtFs#mkdir: name={s} path={s}", .{ name, path });
+        const name = path_segments.basename();
+        const path = path_segments.parent_dir();
+
+        if (builtin.mode == .Debug) {
+            const path_str = try path.toString(allocator);
+            defer allocator.free(path_str);
+            std.log.debug("VirtFs#mkdir: name={s} path={s}", .{
+                name,
+                path_str,
+            });
+        }
 
         const parent_dir = try self.disk.resolvePath(path);
 
@@ -346,10 +433,10 @@ pub const VirtualFs = struct {
 };
 
 pub const VirtualFsNode = union(enum) {
-    File: struct { name: CStr, fd: std.posix.fd_t, parent: *VirtualFsNode },
-    Dir: struct { name: CStr, children: std.ArrayListUnmanaged(*VirtualFsNode), parent: ?*VirtualFsNode },
+    File: struct { name: FsPath.Segment, fd: std.posix.fd_t, parent: *VirtualFsNode },
+    Dir: struct { name: FsPath.Segment, children: std.ArrayListUnmanaged(*VirtualFsNode), parent: ?*VirtualFsNode },
 
-    pub fn name(self: VirtualFsNode) CStr {
+    pub fn name(self: VirtualFsNode) FsPath.Segment {
         return switch (self) {
             inline else => |it| it.name,
         };
@@ -376,7 +463,7 @@ pub const VirtualFsNode = union(enum) {
     pub fn resolvePath(root: *VirtualFsNode, path: FsPath) FsError!*VirtualFsNode {
         var it = root;
 
-        for (path) |path_segment| {
+        for (path.segments) |path_segment| {
             if (std.mem.eql(u8, ".", path_segment)) {
                 continue;
             }
@@ -438,7 +525,7 @@ const RealFs = struct {
         return .{ .arena = arena };
     }
 
-    pub fn create(self: *RealFs, path_segments: []const CStr) void!FsError {
+    pub fn create(self: *RealFs, path_segments: FsPath) void!FsError {
         _ = self;
         _ = path_segments;
         @panic("Not implemented");
@@ -517,47 +604,44 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     var fs: VirtualFs = try .init(t.allocator);
     defer fs.deinit();
 
-    try fs.mkDir(&[_]CStr{cstr("home")});
-    try fs.mkDir(&[_]CStr{ cstr("home"), cstr("dawid") });
-    try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr(".bashrc") });
-    try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr(".history") });
-    try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr(".xinitrc") });
+    try fs.mkDir(FsPath.fromStaticString("/home"));
+    try fs.mkDir(FsPath.fromStaticString("/home/dawid"));
+    try fs.create(FsPath.fromStaticString("/home/dawid/.bashrc"));
+    try fs.create(FsPath.fromStaticString("/home/dawid/.xinitrc"));
+    try fs.create(FsPath.fromStaticString("/home/dawid/.history"));
 
-    try fs.rm(&[_]CStr{ cstr("home"), cstr("dawid"), cstr(".history") });
-
-    var file = try fs.open(&[_]CStr{ cstr("home"), cstr("dawid"), cstr(".bashrc") });
-
-    try t.sliceEq("File#realpath should get resolved, absolute path", try file.realpath(), &[_]CStr{ cstr("home"), cstr("dawid"), cstr(".bashrc") });
+    var file = try fs.open(FsPath.fromStaticString("/home/../home/dawid/.bashrc"));
+    try t.sliceEq("File#realpath should get resolved, absolute path", (try file.realpath()).segments, FsPath.fromStaticString("/home/dawid/.bashrc").segments);
 
     const stats = fs.stat();
     try t.expectEqual("Should have 1 file opened", 1, stats.opened_files_count);
     try t.expectEqual("Should have 2 files in total", 2, stats.allocated_file_count);
 
     // Add /home/dawid/Pictures/Cat.jpg
-    try fs.mkDir(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("Pictures") });
-    try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("Pictures"), cstr("Cat.jpg") });
+    try fs.mkDir(FsPath.fromStaticString("/home/dawid/Pictures"));
+    try fs.create(FsPath.fromStaticString("/home/dawid/Pictures/Cat.jpg"));
 
     // Resolves Cat.jpg from /home/dawid/Pictures
-    const cat_picture = try fs.resolveRelative(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("Pictures") }, &[_]CStr{"Cat.jpg"});
+    const cat_picture = try fs.resolveRelative(FsPath.fromStaticString("/home/dawid/Pictures"), FsPath.fromStaticString("Cat.jpg"));
     try t.strEq("resolveRelative should default lookup entries in context dir", cat_picture.File.name, "Cat.jpg");
 
     // Fails resolve Cat.jpg from /home/dawid
-    const not_cat_picture = fs.resolveRelative(&[_]CStr{ cstr("home"), cstr("dawid") }, &[_]CStr{"Cat.jpg"});
+    const not_cat_picture = fs.resolveRelative(FsPath.fromStaticString("/home/dawid"), FsPath.fromStaticString("Cat.jpg"));
     try t.expectEqual("resolveRelative should not resolve entries on the wrong level", not_cat_picture, FsError.InvalidPath);
 
     // Resolves /nix from /home/dawid/Pictures
-    try fs.mkDir(&[_]CStr{"nix"});
-    const nix_dir = try fs.resolveRelative(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("Pictures") }, &[_]CStr{ ".", "..", "..", "..", "nix" });
+    try fs.mkDir(FsPath.fromStaticString("/nix"));
+    const nix_dir = try fs.resolveRelative(FsPath.fromStaticString("/home/dawid/Pictures"), FsPath.fromStaticString("./../../nix"));
     try t.strEq("resolveRelative should handle . and .. expressions", nix_dir.Dir.name, "nix");
 
     //  Try to get Cat.jpg through a round-about path
-    const cat_picture_again = try fs.resolveRelative(&[_]CStr{}, &[_]CStr{ "home", "..", "home", ".", "dawid", ".", "Pictures", "Cat.jpg" });
+    const cat_picture_again = try fs.resolveRelative(FsPath.empty, FsPath.fromStaticString("home/../home/dawid/./Pictures/Cat.jpg"));
     try t.strEq("resolveRelative should handle round-about paths", cat_picture_again.File.name, "Cat.jpg");
 
     // FsPath: /home/dawid/notes.txt
     // Read/Write checks
-    try fs.create(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("notes.txt") });
-    var notes_file = try fs.open(&[_]CStr{ cstr("home"), cstr("dawid"), cstr("notes.txt") });
+    try fs.create(FsPath.fromStaticString("/home/dawid/notes.txt"));
+    var notes_file = try fs.open(FsPath.fromStaticString("/home/dawid/notes.txt"));
     try fs.writeAll(notes_file, "1. Ship the project\n");
     const notes_content1 = try fs.readAll(notes_file, t.allocator);
     defer t.allocator.free(notes_content1);
@@ -570,4 +654,7 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
 
     // toString check
     try t.strEq("toString() should render as expected", notes_file.toString(), "/home/dawid/notes.txt");
+
+    const nix_cfg_file_path = FsPath.fromStaticString("/etc/nixos/configuration.nix");
+    try t.strEq("Should render FsPath as expected", try nix_cfg_file_path.toString(t.allocator), "/etc/nixos/configuration.nix");
 }

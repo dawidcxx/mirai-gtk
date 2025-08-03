@@ -40,7 +40,7 @@ pub fn run(testBody: fn (ctx: *Testing) anyerror!void) anyerror!void {
 
 pub fn register(t: *Testing, comptime src: std.builtin.SourceLocation) void {
     t.suite_name = src.fn_name;
-    std.log.info("SUITE: '{s}' START", .{src.fn_name});
+    std.log.info("SUITE '{s}' START", .{src.fn_name});
 }
 
 pub fn setLogLevel(t: Testing, level: std.log.Level) void {

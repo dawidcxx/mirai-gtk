@@ -2,7 +2,7 @@ const std = @import("std");
 const ts = @import("tree-sitter");
 const builtin = @import("builtin");
 const Testing = @import("./testing.zig");
-const File = @import("./file.zig").File;
+const File = @import("./fs.zig").File;
 
 extern fn tree_sitter_tsx() callconv(.C) *ts.Language;
 
@@ -35,8 +35,8 @@ pub const FileParser = struct {
     }
 
     pub fn parse(self: *FileParser) ParserErrors!void {
-        const file_content = self.file.read(self.ctx.allocator) catch |e| {
-            std.debug.panic("Unexpected error while reading file '{s}': '{}'", .{ self.file.name, e });
+        const file_content = self.file.readAll(self.ctx.allocator) catch |e| {
+            std.debug.panic("Unexpected error while reading file '{s}': '{}'", .{ try self.file.toString(), e });
         };
         if (self.ctx.parser.parseString(file_content, self.tree)) |tree| {
             self.clean_cached(); // invalidate all cache on re-parse
