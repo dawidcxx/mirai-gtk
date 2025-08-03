@@ -26,22 +26,56 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const tsstripper = b.addModule("tsstripper", .{
-        .root_source_file = b.path("./src/root.zig"),
+    const root_mod = mkModule(b, .{
+        .name = "ts-strip",
+        .src = b.path("./src/root.zig"),
+        .tree_sitter_dep = tree_sitter,
+        .tree_sitter_lib = typescript_grammar_lib,
         .optimize = optimize,
         .target = target,
     });
-    tsstripper.addImport("tree-sitter", tree_sitter.module("tree-sitter"));
-    tsstripper.linkLibrary(typescript_grammar_lib);
-
-    const tsstripper_tests = b.addTest(.{
-        .root_module = tsstripper,
+    const root_mod_test = mkTest(b, .{ .mod = root_mod, .target = target });
+    const bundler_mod = mkModule(b, .{
+        .name = "ts-strip/bundler",
+        .src = b.path("./src/bundler.zig"),
+        .tree_sitter_dep = tree_sitter,
+        .tree_sitter_lib = typescript_grammar_lib,
+        .optimize = optimize,
         .target = target,
-        .optimize = .Debug,
     });
-
-    const run_tsstripper_tests = b.addRunArtifact(tsstripper_tests);
+    const bundler_mod_test = mkTest(b, .{ .mod = bundler_mod, .target = target });
 
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tsstripper_tests.step);
+    test_step.dependOn(&bundler_mod_test.step);
+    test_step.dependOn(&root_mod_test.step);
+}
+
+const MkTestOptions = struct { mod: *std.Build.Module, target: std.Build.ResolvedTarget };
+
+fn mkTest(b: *std.Build, opts: MkTestOptions) *std.Build.Step.Run {
+    const compile = b.addTest(.{
+        .root_module = opts.mod,
+        .target = opts.target,
+        .optimize = .Debug,
+    });
+    const runner = b.addRunArtifact(compile);
+    return runner;
+}
+
+const MkModuleOptions = struct {
+    name: []const u8,
+    src: std.Build.LazyPath,
+    tree_sitter_dep: *std.Build.Dependency,
+    tree_sitter_lib: *std.Build.Step.Compile,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+};
+
+fn mkModule(b: *std.Build, opts: MkModuleOptions) *std.Build.Module {
+    const mod = b.addModule(opts.name, .{ .root_source_file = opts.src, .optimize = opts.optimize, .target = opts.target });
+
+    mod.addImport("tree-sitter", opts.tree_sitter_dep.module("tree-sitter"));
+    mod.linkLibrary(opts.tree_sitter_lib);
+
+    return mod;
 }
