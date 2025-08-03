@@ -134,10 +134,7 @@ pub const VirtualFs = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         const arena_allocator = arena.allocator();
 
-        const root_entries = std.ArrayListUnmanaged(*VirtualFsNode).initCapacity(arena_allocator, 16) catch unreachable;
-        const disk = try arena_allocator.create(VirtualFsNode);
-        disk.* = .{ .Dir = .{ .name = "@ROOT", .children = root_entries, .parent = null } };
-
+        const disk = try VirtualFsNode.createRoot(arena_allocator);
         const opened_file_paths: std.AutoHashMapUnmanaged(FileId, FsPath) = .empty;
         const to_string_cache: std.AutoArrayHashMapUnmanaged(FileId, []const u8) = .empty;
 
@@ -150,11 +147,13 @@ pub const VirtualFs = struct {
 
     pub fn open(self: *VirtualFs, file_path: FsPath) FsError!File {
         const file_node = try self.disk.resolvePath(file_path);
+        std.log.info("Resolved opening node {s}", .{try file_path.toString(self.arena.allocator())});
 
         // If we find the entry we wanna own the path
         // to avoid any potential memory complications
         const alloc = self.arena.allocator();
-        const file_path_owned = try file_path.clone(alloc);
+
+        const file_path_owned = try file_node.getAbsolutePath(alloc);
 
         // (ab)using the address as the ID
         const file_id: usize = @intFromPtr(file_node);
@@ -245,12 +244,12 @@ pub const VirtualFs = struct {
     }
 
     pub fn create(self: *VirtualFs, path: FsPath) FsError!void {
-        const file_name = path.basename();
-        const file_parent_path = path.parent_dir();
+        const file_name = try path.basename();
+        const file_parent_path = path.parentDir();
 
         const parent_dir = try self.disk.resolvePath(file_parent_path);
 
-        const fd = posix.memfd_createZ(file_name, 0) catch unreachable;
+        const fd = posix.memfd_create(file_name, 0) catch unreachable;
 
         const allocator = self.arena.allocator();
         const file_entry = try allocator.create(VirtualFsNode);
@@ -295,8 +294,8 @@ pub const VirtualFs = struct {
     pub fn mkDir(self: *VirtualFs, path_segments: FsPath) FsError!void {
         const allocator = self.arena.allocator();
 
-        const name = path_segments.basename();
-        const path = path_segments.parent_dir();
+        const name = try path_segments.basename();
+        const path = path_segments.parentDir();
 
         if (builtin.mode == .Debug) {
             const path_str = try path.toString(allocator);
@@ -330,12 +329,41 @@ pub const VirtualFs = struct {
 };
 
 pub const VirtualFsNode = union(enum) {
+    const ROOT_NAME: []const u8 = "@ROOT@";
+
     File: struct { name: FsPath.Segment, fd: std.posix.fd_t, parent: *VirtualFsNode },
     Dir: struct { name: FsPath.Segment, children: std.ArrayListUnmanaged(*VirtualFsNode), parent: ?*VirtualFsNode },
+
+    pub fn createRoot(alloc: std.mem.Allocator) error{OutOfMemory}!*VirtualFsNode {
+        const root_entries_list = try std.ArrayListUnmanaged(*VirtualFsNode).initCapacity(alloc, 16);
+        const root_node = try alloc.create(VirtualFsNode);
+        root_node.* = .{ .Dir = .{
+            .name = ROOT_NAME,
+            .parent = null,
+            .children = root_entries_list,
+        } };
+        return root_node;
+    }
+
+    pub fn isRoot(self: *VirtualFsNode) bool {
+        return switch (self.*) {
+            .File => false,
+            .Dir => |d| {
+                return ROOT_NAME.ptr == d.name.ptr;
+            },
+        };
+    }
 
     pub fn name(self: VirtualFsNode) FsPath.Segment {
         return switch (self) {
             inline else => |it| it.name,
+        };
+    }
+
+    pub fn parentNode(self: *VirtualFsNode) ?*VirtualFsNode {
+        return switch (self.*) {
+            .File => |file| file.parent,
+            .Dir => |dir| dir.parent,
         };
     }
 
@@ -355,6 +383,18 @@ pub const VirtualFsNode = union(enum) {
                 return count;
             },
         }
+    }
+
+    pub fn getAbsolutePath(self: *VirtualFsNode, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        var builder = try FsPath.Builder.initBackward(alloc, self.name());
+        var it: *VirtualFsNode = self;
+        while (it.parentNode()) |current_node| {
+            if (current_node.isRoot()) break;
+            try builder.push(alloc, current_node.name());
+            it = current_node;
+        }
+        const resolved_path = try builder.build_absolute(alloc);
+        return resolved_path;
     }
 
     pub fn resolvePath(root: *VirtualFsNode, path: FsPath) FsError!*VirtualFsNode {
@@ -501,44 +541,47 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     var fs: VirtualFs = try .init(t.allocator);
     defer fs.deinit();
 
-    try fs.mkDir(FsPath.fromStaticString("/home"));
-    try fs.mkDir(FsPath.fromStaticString("/home/dawid"));
-    try fs.create(FsPath.fromStaticString("/home/dawid/.bashrc"));
-    try fs.create(FsPath.fromStaticString("/home/dawid/.xinitrc"));
-    try fs.create(FsPath.fromStaticString("/home/dawid/.history"));
+    try fs.mkDir(FsPath.static("/home"));
+    try fs.mkDir(FsPath.static("/home/dawid"));
+    try fs.create(FsPath.static("/home/dawid/.bashrc"));
+    try fs.create(FsPath.static("/home/dawid/.xinitrc"));
+    try fs.create(FsPath.static("/home/dawid/.history"));
 
-    var file = try fs.open(FsPath.fromStaticString("/home/../home/dawid/.bashrc"));
-    try t.sliceEq("File#realpath should get resolved, absolute path", (try file.realpath()).segments, FsPath.fromStaticString("/home/dawid/.bashrc").segments);
+    var file = try fs.open(FsPath.static("/home/../home/dawid/../dawid/.bashrc"));
+    const resolved_file = try file.realpath();
+    const resolved_file_path = try resolved_file.toString(t.allocator);
+    defer t.allocator.free(resolved_file_path);
+    try t.strEq("File#realpath should get resolved, absolute path", resolved_file_path, "/home/dawid/.bashrc");
 
     const stats = fs.stat();
     try t.expectEqual("Should have 1 file opened", 1, stats.opened_files_count);
-    try t.expectEqual("Should have 2 files in total", 2, stats.allocated_file_count);
+    try t.expectEqual("Should have 3 files in total", 3, stats.allocated_file_count);
 
     // Add /home/dawid/Pictures/Cat.jpg
-    try fs.mkDir(FsPath.fromStaticString("/home/dawid/Pictures"));
-    try fs.create(FsPath.fromStaticString("/home/dawid/Pictures/Cat.jpg"));
+    try fs.mkDir(FsPath.static("/home/dawid/Pictures"));
+    try fs.create(FsPath.static("/home/dawid/Pictures/Cat.jpg"));
 
     // Resolves Cat.jpg from /home/dawid/Pictures
-    const cat_picture = try fs.resolveRelative(FsPath.fromStaticString("/home/dawid/Pictures"), FsPath.fromStaticString("Cat.jpg"));
+    const cat_picture = try fs.resolveRelative(FsPath.static("/home/dawid/Pictures"), FsPath.static("Cat.jpg"));
     try t.strEq("resolveRelative should default lookup entries in context dir", cat_picture.File.name, "Cat.jpg");
 
     // Fails resolve Cat.jpg from /home/dawid
-    const not_cat_picture = fs.resolveRelative(FsPath.fromStaticString("/home/dawid"), FsPath.fromStaticString("Cat.jpg"));
+    const not_cat_picture = fs.resolveRelative(FsPath.static("/home/dawid"), FsPath.static("Cat.jpg"));
     try t.expectEqual("resolveRelative should not resolve entries on the wrong level", not_cat_picture, FsError.InvalidPath);
 
     // Resolves /nix from /home/dawid/Pictures
-    try fs.mkDir(FsPath.fromStaticString("/nix"));
-    const nix_dir = try fs.resolveRelative(FsPath.fromStaticString("/home/dawid/Pictures"), FsPath.fromStaticString("./../../nix"));
+    try fs.mkDir(FsPath.static("/nix"));
+    const nix_dir = try fs.resolveRelative(FsPath.static("/home/dawid/Pictures"), FsPath.static("./../../../nix"));
     try t.strEq("resolveRelative should handle . and .. expressions", nix_dir.Dir.name, "nix");
 
     //  Try to get Cat.jpg through a round-about path
-    const cat_picture_again = try fs.resolveRelative(FsPath.empty, FsPath.fromStaticString("home/../home/dawid/./Pictures/Cat.jpg"));
+    const cat_picture_again = try fs.resolveRelative(FsPath.empty, FsPath.static("home/../home/dawid/./Pictures/Cat.jpg"));
     try t.strEq("resolveRelative should handle round-about paths", cat_picture_again.File.name, "Cat.jpg");
 
     // FsPath: /home/dawid/notes.txt
     // Read/Write checks
-    try fs.create(FsPath.fromStaticString("/home/dawid/notes.txt"));
-    var notes_file = try fs.open(FsPath.fromStaticString("/home/dawid/notes.txt"));
+    try fs.create(FsPath.static("/home/dawid/notes.txt"));
+    var notes_file = try fs.open(FsPath.static("/home/dawid/notes.txt"));
     try fs.writeAll(notes_file, "1. Ship the project\n");
     const notes_content1 = try fs.readAll(notes_file, t.allocator);
     defer t.allocator.free(notes_content1);
@@ -552,6 +595,8 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     // toString check
     try t.strEq("toString() should render as expected", notes_file.toString(), "/home/dawid/notes.txt");
 
-    const nix_cfg_file_path = FsPath.fromStaticString("/etc/nixos/configuration.nix");
-    try t.strEq("Should render FsPath as expected", try nix_cfg_file_path.toString(t.allocator), "/etc/nixos/configuration.nix");
+    const nix_cfg_file_path = FsPath.static("/etc/nixos/configuration.nix");
+    const nix_cfg_file_path_string = try nix_cfg_file_path.toString(t.allocator);
+    defer t.allocator.free(nix_cfg_file_path_string);
+    try t.strEq("Should render FsPath as expected", nix_cfg_file_path_string, "/etc/nixos/configuration.nix");
 }
