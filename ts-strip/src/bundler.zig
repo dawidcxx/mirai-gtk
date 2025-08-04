@@ -4,10 +4,9 @@ const ParserContext = @import("./parser.zig").ParserContext;
 const FileParser = @import("./parser.zig").FileParser;
 const Import = @import("./parser.zig").Import;
 const Fs = @import("./fs.zig");
+const FsPath = @import("./FsPath.zig");
 
 const FileSystem = Fs.FileSystem;
-const File = Fs.File;
-const FsPath = Fs.FsPath;
 
 pub const Bundler = struct {
     const Self = @This();
@@ -39,8 +38,10 @@ pub const Bundler = struct {
         defer parser_ctx.deinit();
 
         var entry = try self.fs.open(entry_path);
+        const entry_abs_path = try entry.realpath();
+        defer entry.close();
 
-        try module_map.put(alloc, entry.toString(), try parser_ctx.forFile(entry));
+        try module_map.put(alloc, try entry_abs_path.toString(alloc), try parser_ctx.forFile(entry));
     }
 };
 
@@ -90,29 +91,12 @@ fn basicBundlerTest(ctx: *Testing) anyerror!void {
     ctx.register(@src());
 
     // Fixtures: begin
-    const MAIN_ENTRY = .{
-        @as(FsPath, &[_][:0]const u8{"main.ts"}),
-        @as([]const u8, 
-            \\ import { max } from './utils/math';
-            \\ import { fs } from '@mirai-gtk/core';
-            \\ console.log(max(2,4));
-            \\
-        ),
+    const FILES: []const FsPath = &[_]FsPath{ FsPath.static("/main.ts"), FsPath.static("/math.ts") };
+    const CONTENT: []const []const u8 = &[_][]const u8{
+        "import { add } from './math';\nconsole.log(add(2, 3));",
+        "export function add(a: number, b: number): number {\n    return a + b;\n}",
     };
-    const UTILS = .{
-        @as(FsPath, &[_][:0]const u8{ "utils", "math.ts" }), @as([]const u8, 
-            \\ export function max(...args: number[]) { 
-            \\    throw new Error('Not implemented');
-            \\ }
-        ),
-    };
-    const TS_SOURCES = [_]struct { FsPath, []const u8 }{
-        MAIN_ENTRY,
-        UTILS,
-    };
-    const OUT_FILE = &[_][:0]const u8{"bundle.js"};
     // Fixtures: end
-
     var fs: FileSystem = try .ofVirtual(ctx.allocator);
     defer fs.destroy(ctx.allocator);
 
@@ -120,14 +104,12 @@ fn basicBundlerTest(ctx: *Testing) anyerror!void {
     defer bundler.deinit();
 
     // Prepare disk structure
-    for (TS_SOURCES) |file| {
-        const path = file.@"0";
-        const content = file.@"1";
-        try fs.create(path);
-        var entry_file = try fs.open(path);
+    for (FILES, CONTENT) |file, content| {
+        try fs.create(file);
+        var entry_file = try fs.open(file);
         defer entry_file.close();
         try entry_file.writeAll(content);
     }
 
-    try bundler.bundle(MAIN_ENTRY.@"0", OUT_FILE);
+    try bundler.bundle(FsPath.static("/main.ts"), FsPath.static("/bundle.out.js"));
 }

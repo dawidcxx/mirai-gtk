@@ -6,6 +6,7 @@ const FsPath = @import("./FsPath.zig");
 
 pub const FsError = error{ OutOfMemory, InvalidPath, IOError };
 
+// File represents an opened file in the filesystem.
 pub const File = struct {
     // Guaranteed to be unique for each given file
     // regardless of the path i.e foo.txt == ./baz/../foo.txt
@@ -22,15 +23,15 @@ pub const File = struct {
     }
 
     pub fn close(self: *File) void {
-        self.fs.close(self);
+        self.fs.close(self.*);
     }
 
     pub fn writeAll(self: *File, content: []const u8) FsError!void {
-        return self.fs.writeAll(self, content);
+        return self.fs.writeAll(self.*, content);
     }
 
-    pub fn readAll(self: File, alloc: std.mem.Allocator) FsError![]u8 {
-        return self.fs.readAll(self, alloc);
+    pub fn readAll(self: *File, alloc: std.mem.Allocator) FsError![]u8 {
+        return self.fs.readAll(self.*, alloc);
     }
 };
 
@@ -85,14 +86,14 @@ pub const FileSystem = union(enum) {
 
     pub fn open(self: *FileSystem, file_path: FsPath) FsError!File {
         switch (self.*) {
-            inline else => |fs| fs.open(file_path),
+            inline else => |fs| return fs.open(file_path),
         }
     }
 
     pub fn create(self: *FileSystem, file_path: FsPath) FsError!void {
-        switch (self.*) {
+        return switch (self.*) {
             inline else => |fs| fs.create(file_path),
-        }
+        };
     }
 
     pub fn rm(self: *FileSystem, file_path: FsPath) FsError!void {
@@ -203,7 +204,7 @@ pub const VirtualFs = struct {
     }
 
     pub fn close(self: *VirtualFs, file: File) void {
-        if (!self.opened_file_paths.swapRemove(file.id)) {
+        if (!self.opened_file_paths.remove(file.id)) {
             @panic("VirtFs#close called on a already closed or not opened file");
         }
     }
@@ -462,7 +463,7 @@ const RealFs = struct {
         return .{ .arena = arena };
     }
 
-    pub fn create(self: *RealFs, path_segments: FsPath) void!FsError {
+    pub fn create(self: *RealFs, path_segments: FsPath) FsError!void {
         _ = self;
         _ = path_segments;
         @panic("Not implemented");
@@ -486,7 +487,7 @@ const RealFs = struct {
         @panic("Not implemented");
     }
 
-    pub fn open(self: *RealFs, file_path: FsPath) FsError!FsPath {
+    pub fn open(self: *RealFs, file_path: FsPath) FsError!File {
         _ = self;
         _ = file_path;
         @panic("Not implemented");
