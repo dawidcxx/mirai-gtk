@@ -13,6 +13,7 @@ pub const ParserErrors = error{
     OutOfMemory,
     ParseError,
     FileIsNotParsed,
+    IOError,
 };
 
 pub const FileParser = struct {
@@ -36,7 +37,8 @@ pub const FileParser = struct {
 
     pub fn parse(self: *FileParser) ParserErrors!void {
         const file_content = self.file.readAll(self.ctx.allocator) catch |e| {
-            std.debug.panic("Unexpected error while reading file '{s}': '{}'", .{ try self.file.toString(), e });
+            std.log.info("Failed to read file '{s}' due to {s}", .{ self.file.toString(), @errorName(e) });
+            return ParserErrors.IOError;
         };
         if (self.ctx.parser.parseString(file_content, self.tree)) |tree| {
             self.clean_cached(); // invalidate all cache on re-parse
@@ -98,11 +100,11 @@ pub const FileParser = struct {
 
 pub const ParserContext = struct {
     allocator: std.mem.Allocator,
-    file_parsers: std.ArrayListUnmanaged(FileParser),
+    file_parsers: std.ArrayListUnmanaged(*FileParser),
     parser: *ts.Parser,
 
     pub fn init(allocator: std.mem.Allocator) !ParserContext {
-        const file_parsers = std.ArrayListUnmanaged(FileParser).initCapacity(allocator, 16) catch {
+        const file_parsers = std.ArrayListUnmanaged(*FileParser).initCapacity(allocator, 16) catch {
             return ParserErrors.OutOfMemory;
         };
         const ts_parser = ts.Parser.create();
@@ -110,15 +112,21 @@ pub const ParserContext = struct {
         return .{ .allocator = allocator, .file_parsers = file_parsers, .parser = ts_parser };
     }
 
-    pub fn forFile(self: *ParserContext, file: File) ParserErrors!FileParser {
-        const file_parser: FileParser = try .init(self, file);
-        self.file_parsers.append(self.allocator, file_parser) catch {
+    pub fn forFile(self: *ParserContext, file: File) ParserErrors!*FileParser {
+        const parser = try self.allocator.create(FileParser);
+        parser.* = try .init(self, file);
+        self.file_parsers.append(self.allocator, parser) catch {
+            self.allocator.destroy(parser);
             return ParserErrors.OutOfMemory;
         };
-        return file_parser;
+        return parser;
     }
 
     pub fn deinit(self: *ParserContext) void {
+        for (self.file_parsers.items) |fp| {
+            fp.deinit();
+            self.allocator.destroy(fp);
+        }
         self.file_parsers.deinit(self.allocator);
     }
 };
@@ -167,10 +175,18 @@ test "simple parser check" {
 }
 
 fn simpleParserCheck(testing: *Testing) anyerror!void {
+    const Fs = @import("./fs.zig").VirtualFs;
+    const FsPath = @import("./FsPath.zig").FsPath;
+
     testing.register(@src());
     testing.setLogLevel(.info);
 
-    const test_file = File.virtual("test.tsx");
+    var fs = try Fs.init(testing.allocator);
+
+    try fs.mkDir(FsPath.static("/test-dir"));
+    try fs.create(FsPath.static("/test-dir/test.tsx"));
+
+    var test_file = try fs.open(FsPath.static("/test-dir/test.tsx"));
     defer test_file.close();
 
     const file_content =
@@ -179,12 +195,12 @@ fn simpleParserCheck(testing: *Testing) anyerror!void {
         \\ import bar from 'npm'
         \\ const gg = 'vv'
     ;
-    test_file.write(file_content[0..]);
+    try test_file.writeAll(file_content[0..]);
 
     var ctx: ParserContext = try .init(testing.allocator);
     defer ctx.deinit();
 
-    var file_parser: FileParser = try ctx.forFile(test_file);
+    var file_parser: *FileParser = try ctx.forFile(test_file);
     defer file_parser.deinit();
 
     try file_parser.parse();
