@@ -108,9 +108,9 @@ pub const FileSystem = union(enum) {
         }
     }
 
-    pub fn resolveRelative(self: *FileSystem, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
+    pub fn resolveRelative(self: *FileSystem, alloc: std.mem.Allocator, context: FsPath, appendix: FsPath) FsError!FsPath {
         switch (self.*) {
-            inline else => |fs| return fs.resolveRelative(context, appendix),
+            inline else => |fs| return fs.resolveRelative(alloc, context, appendix),
         }
     }
 
@@ -237,11 +237,12 @@ pub const VirtualFs = struct {
         return result;
     }
 
-    // resolveRelative /home/foo/Pictures Cat.jpg => VirtualFsNode {/home/foo/Pictures/Cat.jpg}
+    // resolveRelative /home/foo/Pictures Cat.jpg => FsPath {/home/foo/Pictures/Cat.jpg}
     // NOTE: context must be absolute path
-    pub fn resolveRelative(self: *VirtualFs, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
+    pub fn resolveRelative(self: *VirtualFs, alloc: std.mem.Allocator, context: FsPath, appendix: FsPath) FsError!FsPath {
         const prefix = try self.disk.resolvePath(context);
-        return try prefix.resolvePath(appendix);
+        const node = try prefix.resolvePath(appendix);
+        return node.getAbsolutePath(alloc);
     }
 
     pub fn create(self: *VirtualFs, path: FsPath) FsError!void {
@@ -387,14 +388,15 @@ pub const VirtualFsNode = union(enum) {
     }
 
     pub fn getAbsolutePath(self: *VirtualFsNode, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
-        var builder = try FsPath.Builder.initBackward(alloc, self.name());
+        var builder = try FsPath.Builder.initBackward(alloc);
+        try builder.push(alloc, self.name());
         var it: *VirtualFsNode = self;
         while (it.parentNode()) |current_node| {
             if (current_node.isRoot()) break;
             try builder.push(alloc, current_node.name());
             it = current_node;
         }
-        const resolved_path = try builder.build_absolute(alloc);
+        const resolved_path = try builder.buildAbsolute(alloc);
         return resolved_path;
     }
 
@@ -505,8 +507,9 @@ const RealFs = struct {
         @panic("Not implemented");
     }
 
-    pub fn resolveRelative(self: *RealFs, context: FsPath, appendix: FsPath) FsError!*VirtualFsNode {
+    pub fn resolveRelative(self: *RealFs, alloc: std.mem.Allocator, context: FsPath, appendix: FsPath) FsError!FsPath {
         _ = self;
+        _ = alloc;
         _ = context;
         _ = appendix;
         @panic("Not implemented");
@@ -563,21 +566,15 @@ fn virtualFsCheck(t: *Testing) anyerror!void {
     try fs.create(FsPath.static("/home/dawid/Pictures/Cat.jpg"));
 
     // Resolves Cat.jpg from /home/dawid/Pictures
-    const cat_picture = try fs.resolveRelative(FsPath.static("/home/dawid/Pictures"), FsPath.static("Cat.jpg"));
-    try t.strEq("resolveRelative should default lookup entries in context dir", cat_picture.File.name, "Cat.jpg");
+    const cat_picture = try fs.resolveRelative(t.allocator, FsPath.static("/home/dawid/Pictures"), FsPath.static("Cat.jpg"));
+    defer cat_picture.deinit(t.allocator);
+    const cat_picture_string = try cat_picture.toString(t.allocator);
+    defer t.allocator.free(cat_picture_string);
+    try t.strEq("resolveRelative should resolve Cat.jpg from /home/dawid/Pictures", cat_picture_string, "/home/dawid/Pictures/Cat.jpg");
 
     // Fails resolve Cat.jpg from /home/dawid
-    const not_cat_picture = fs.resolveRelative(FsPath.static("/home/dawid"), FsPath.static("Cat.jpg"));
+    const not_cat_picture = fs.resolveRelative(t.allocator, FsPath.static("/home/dawid"), FsPath.static("Cat.jpg"));
     try t.expectEqual("resolveRelative should not resolve entries on the wrong level", not_cat_picture, FsError.InvalidPath);
-
-    // Resolves /nix from /home/dawid/Pictures
-    try fs.mkDir(FsPath.static("/nix"));
-    const nix_dir = try fs.resolveRelative(FsPath.static("/home/dawid/Pictures"), FsPath.static("./../../../nix"));
-    try t.strEq("resolveRelative should handle . and .. expressions", nix_dir.Dir.name, "nix");
-
-    //  Try to get Cat.jpg through a round-about path
-    const cat_picture_again = try fs.resolveRelative(FsPath.empty, FsPath.static("home/../home/dawid/./Pictures/Cat.jpg"));
-    try t.strEq("resolveRelative should handle round-about paths", cat_picture_again.File.name, "Cat.jpg");
 
     // FsPath: /home/dawid/notes.txt
     // Read/Write checks

@@ -10,7 +10,9 @@ absolute: bool,
 
 pub const FsPath = @This();
 pub const Segment = []const u8;
-pub const empty: FsPath = .{ .segments = &[_]FsPath.Segment{}, .absolute = false };
+pub const root: FsPath = .{ .segments = &[_]FsPath.Segment{}, .absolute = true };
+pub const current_dir: FsPath = .{ .segments = &[_]FsPath.Segment{}, .absolute = false };
+pub const Hash = HashImpl;
 
 pub fn parentDir(path: FsPath) FsPath {
     const all_but_last = path.segments[0 .. path.segments.len - 1];
@@ -47,6 +49,22 @@ pub fn toStringZ(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}!
 
 pub fn deinit(self: FsPath, alloc: std.mem.Allocator) void {
     alloc.free(self.segments);
+}
+
+pub fn fromString(string: []const u8, allocator: std.mem.Allocator) !FsPath {
+    var builder = try FsPath.Builder.initForward(allocator);
+    var it = std.mem.splitScalar(u8, string, '/');
+    while (it.next()) |segment| {
+        if (segment.len == 0 or (segment[0] == '.' and segment.len == 1)) {
+            continue; // skip empty segments
+        }
+        try builder.push(allocator, segment);
+    }
+    if (std.mem.startsWith(u8, string, "/")) {
+        return try builder.buildAbsolute(allocator);
+    } else {
+        return try builder.buildRelative(allocator);
+    }
 }
 
 pub fn static(comptime path: []const u8) FsPath {
@@ -93,18 +111,16 @@ pub const Builder = struct {
     segments: std.ArrayListUnmanaged(Segment),
     backward_mode: bool,
 
-    pub fn initForward(alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!Builder {
-        var segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
-        try segments.append(alloc, segment);
+    pub fn initForward(alloc: std.mem.Allocator) error{OutOfMemory}!Builder {
+        const segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
         return .{
             .segments = segments,
             .backward_mode = false,
         };
     }
 
-    pub fn initBackward(alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!Builder {
-        var segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
-        try segments.append(alloc, segment);
+    pub fn initBackward(alloc: std.mem.Allocator) error{OutOfMemory}!Builder {
+        const segments = try std.ArrayListUnmanaged(Segment).initCapacity(alloc, 8);
         return .{
             .segments = segments,
             .backward_mode = true,
@@ -115,19 +131,53 @@ pub const Builder = struct {
         try self.segments.append(alloc, segment);
     }
 
-    pub fn build_absolute(self: *Builder, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+    pub fn buildAbsolute(self: *Builder, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        return self.build(alloc, true);
+    }
+
+    pub fn buildRelative(self: *Builder, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        return self.build(alloc, false);
+    }
+
+    fn build(self: *Builder, alloc: std.mem.Allocator, is_absolute: bool) error{OutOfMemory}!FsPath {
         const segments_owned = try self.segments.toOwnedSlice(alloc);
         if (self.backward_mode) {
             std.mem.reverse(Segment, segments_owned);
         }
         return .{
-            .absolute = true,
+            .absolute = is_absolute,
             .segments = segments_owned,
         };
     }
 };
 
-// private utility fns
+const HashImpl = struct {
+    pub fn hash(self: HashImpl, key: FsPath) u32 {
+        _ = self;
+        const seed_n: u64 = if (key.isAbsolute()) 0xDEADBEEF else 0xBEEFDEAD;
+        var hasher = std.hash.Wyhash.init(seed_n);
+        for (key.segments) |segment| {
+            hasher.update(segment);
+        }
+        return @truncate(hasher.final());
+    }
+
+    pub fn eql(self: HashImpl, fs_path1: FsPath, fs_path2: FsPath, index: usize) bool {
+        _ = self;
+        _ = index;
+        if (fs_path1.segments.len != fs_path2.segments.len) {
+            return false;
+        }
+        for (fs_path1.segments, fs_path2.segments) |seg1, seg2| {
+            if (!std.mem.eql(u8, seg1, seg2)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+// private
 inline fn countSegmentLength(path: FsPath) usize {
     var sum: usize = 0;
     for (path.segments) |segment| sum += segment.len;
@@ -135,13 +185,25 @@ inline fn countSegmentLength(path: FsPath) usize {
 }
 
 inline fn getSeparatorCount(path: FsPath) usize {
-    return if (path.absolute) path.segments.len else if (path.segments.len > 0) path.segments.len - 1 else 0;
+    if (path.absolute) {
+        return @max(1, path.segments.len);
+    } else {
+        return @max(1, path.segments.len) + 1;
+    }
 }
 
 inline fn fmtPath(path: FsPath, buf: []u8) void {
     var pos: usize = 0;
+    if (path.absolute) {
+        buf[pos] = '/';
+        pos += 1;
+    } else {
+        buf[pos] = '.';
+        buf[pos + 1] = '/';
+        pos += 2;
+    }
     for (path.segments, 0..) |segment, i| {
-        if (path.absolute or i > 0) {
+        if (i > 0) {
             buf[pos] = '/';
             pos += 1;
         }
@@ -171,6 +233,10 @@ fn validateAbsolutePaths(t: *Testing) anyerror!void {
     const path_str = try path.toString(alloc);
     defer alloc.free(path_str);
     try t.strEq("Should render the path to a string correctly", path_str, "/usr/local/bin");
+
+    const root_str = try root.toString(t.allocator);
+    defer t.allocator.free(root_str);
+    try t.strEq("Should render root path '/' correctly", root_str, "/");
 }
 
 fn validateRelativePaths(t: *Testing) anyerror!void {
@@ -186,18 +252,23 @@ fn validateRelativePaths(t: *Testing) anyerror!void {
 
     const path_str = try path.toStringZ(alloc);
     defer alloc.free(path_str);
-    try t.strEq("Should render the path to a string correctly", path_str, ".config/nvim/init.lua");
+    try t.strEq("Should render the path to a string correctly", path_str, "./.config/nvim/init.lua");
+
+    const current_dir_str = try current_dir.toString(alloc);
+    defer alloc.free(current_dir_str);
+    try t.strEq("Should render current_directory path as './'", current_dir_str, "./");
 }
 
 fn validateRuntimePaths(t: *Testing) anyerror!void {
     t.register(@src());
     const alloc = t.allocator;
 
-    var builder = try FsPath.Builder.initBackward(alloc, "notes.txt");
+    var builder = try FsPath.Builder.initBackward(alloc);
+    try builder.push(alloc, "notes.txt");
     try builder.push(alloc, "dawid");
     try builder.push(alloc, "home");
 
-    const path = try builder.build_absolute(alloc);
+    const path = try builder.buildAbsolute(alloc);
     defer path.deinit(alloc);
 
     const path_str = try path.toString(alloc);

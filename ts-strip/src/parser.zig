@@ -3,6 +3,7 @@ const ts = @import("tree-sitter");
 const builtin = @import("builtin");
 const Testing = @import("./testing.zig");
 const File = @import("./fs.zig").File;
+const FsPath = @import("./FsPath.zig");
 
 extern fn tree_sitter_tsx() callconv(.C) *ts.Language;
 
@@ -213,8 +214,12 @@ pub const Imports = struct {
 pub const Import = struct {
     src: []const u8,
 
-    pub fn is_relative(self: Import) bool {
-        return std.mem.eql(u8, self.src[0], ".");
+    pub fn isRelative(self: Import) bool {
+        return self.src.len > 0 and self.src[0] == '.';
+    }
+
+    pub fn toPath(self: Import, allocator: std.mem.Allocator) error{OutOfMemory}!FsPath {
+        return FsPath.fromString(self.src, allocator);
     }
 };
 
@@ -224,7 +229,6 @@ test "simple parser check" {
 
 fn simpleParserCheck(testing: *Testing) anyerror!void {
     const Fs = @import("./fs.zig").VirtualFs;
-    const FsPath = @import("./FsPath.zig").FsPath;
 
     testing.register(@src());
     testing.setLogLevel(.info);

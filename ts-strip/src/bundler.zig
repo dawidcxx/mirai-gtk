@@ -5,9 +5,11 @@ const FileParser = @import("./parser.zig").FileParser;
 const Import = @import("./parser.zig").Import;
 const Fs = @import("./fs.zig");
 const FsPath = @import("./FsPath.zig");
-
 const FileSystem = Fs.FileSystem;
 
+const ModuleMap = std.ArrayHashMapUnmanaged(FsPath, *FileParser, FsPath.Hash, true);
+
+// public interface
 pub const Bundler = struct {
     const Self = @This();
 
@@ -31,64 +33,57 @@ pub const Bundler = struct {
 
         const alloc = self.arena.allocator();
 
-        var module_map: std.StringHashMapUnmanaged(*FileParser) = .empty;
+        var module_map: ModuleMap = .empty;
         defer module_map.deinit(alloc);
 
         var parser_ctx = try ParserContext.init(alloc);
         defer parser_ctx.deinit();
 
         var entry = try self.fs.open(entry_path);
-        const entry_abs_path = try entry.realpath();
-        defer entry.close();
+        const entry_absolute_path = try entry.realpath();
 
-        try module_map.put(alloc, try entry_abs_path.toString(alloc), try parser_ctx.forFile(entry));
+        try collectModules(alloc, self.fs, &parser_ctx, &module_map, entry_absolute_path);
     }
 };
 
-const Module = struct {
-    file_parser: *FileParser,
-
-    inline fn isParsed(self: Module) bool {
-        return self.file_parser.isParsed();
-    }
-
-    inline fn parse(self: Module) !void {
-        try self.file_parser.parse();
-    }
-
-    inline fn getImports(self: Module) ![]Import {
-        return self.file_parser.getReferencedImports();
-    }
-
-    inline fn getPathId(self: Module, allocator: std.mem.Allocator, import: Import) ![]const u8 {
-        _ = self;
-        _ = allocator;
-        _ = import;
-        return error.NotImplemented;
-    }
-};
-
-fn collectRecursive(allocator: std.mem.Allocator, module: *Module, out_map: *std.StringHashMap(Module)) !void {
-    if (module.isParsed()) {
-        @panic("Recursive modules aren't handled yet");
+// utility fns
+fn collectModules(
+    alloc: std.mem.Allocator,
+    fs: *FileSystem,
+    parser_ctx: *ParserContext,
+    module_map: *ModuleMap,
+    absolute_fs_path: FsPath,
+) !void {
+    if (module_map.get(absolute_fs_path)) |file_parser| {
+        std.log.debug("module for file='{s}' parsed into source set", .{file_parser.file.toString()});
+        return;
     } else {
-        try module.parse(); // todo: better error handling
-        for (try module.getImports()) |import| {
-            const module_path_id = try module.getPathId(allocator, import);
-            if (!out_map.contains(module_path_id)) {
-                @panic("RIP");
+        const file = try fs.open(absolute_fs_path);
+        const absolute_path = (try file.realpath()).parentDir();
+        const parser = try parser_ctx.forFile(file);
+        try parser.parse();
+        try module_map.put(alloc, absolute_path, parser);
+        const imports = try parser.getReferencedImports();
+        for (imports) |import| {
+            if (import.isRelative()) {
+                const import_path = try import.toPath(alloc);
+                std.log.info("Resolving relative import '{s}' against '{s}'", .{ try import_path.toString(alloc), try absolute_path.toString(alloc) });
+                const resolved_path = try fs.resolveRelative(alloc, absolute_path, import_path);
+                try collectModules(alloc, fs, parser_ctx, module_map, resolved_path);
+            } else {
+                @panic("TODO: absolute imports");
             }
         }
     }
-    return error.NotImplemented;
 }
 
+// tests
 test "run basicBundlerTest" {
     try Testing.run(basicBundlerTest);
 }
 
-fn basicBundlerTest(ctx: *Testing) anyerror!void {
-    ctx.register(@src());
+fn basicBundlerTest(t: *Testing) anyerror!void {
+    t.register(@src());
 
     // Fixtures: begin
     const FILES: []const FsPath = &[_]FsPath{ FsPath.static("/main.ts"), FsPath.static("/math.ts") };
@@ -97,10 +92,10 @@ fn basicBundlerTest(ctx: *Testing) anyerror!void {
         "export function add(a: number, b: number): number {\n    return a + b;\n}",
     };
     // Fixtures: end
-    var fs: FileSystem = try .ofVirtual(ctx.allocator);
-    defer fs.destroy(ctx.allocator);
+    var fs: FileSystem = try .ofVirtual(t.allocator);
+    defer fs.destroy(t.allocator);
 
-    var bundler: Bundler = .init(ctx.allocator, &fs);
+    var bundler: Bundler = .init(t.allocator, &fs);
     defer bundler.deinit();
 
     // Prepare disk structure
