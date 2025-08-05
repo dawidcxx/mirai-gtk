@@ -89,7 +89,7 @@ fn basicBundlerTest(t: *Testing) anyerror!void {
     const FILES: []const FsPath = &[_]FsPath{ FsPath.static("/main.ts"), FsPath.static("/math.ts") };
     const CONTENT: []const []const u8 = &[_][]const u8{
         "import { add } from './math';\nconsole.log(add(2, 3));",
-        "export function add(a: number, b: number): number {\n    return a + b;\n}",
+        "export function add(a: number, b: number): number { return a + b; }\n",
     };
     // Fixtures: end
     var fs: FileSystem = try .ofVirtual(t.allocator);
@@ -106,5 +106,18 @@ fn basicBundlerTest(t: *Testing) anyerror!void {
         try entry_file.writeAll(content);
     }
 
-    try bundler.bundle(FsPath.static("/main.ts"), FsPath.static("/bundle.out.js"));
+    const output_path = FsPath.static("/bundle.out.js");
+    try bundler.bundle(FsPath.static("/main.ts"), output_path);
+
+    var output_file = try fs.open(output_path);
+    defer output_file.close();
+    const output_content = try output_file.readAll(t.allocator);
+    defer t.allocator.free(output_content);
+
+    const expected_output =
+        \\ function add(a, b) { return a + b; }\n
+        \\ console.log(add(2, 3));\n
+    ;
+
+    try t.strEq("Should bundle as expected", output_content, expected_output[0..]);
 }
