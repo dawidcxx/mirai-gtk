@@ -223,7 +223,7 @@ pub const Import = struct {
     }
 };
 
-test "simple parser check" {
+test "ts-strip/parser simpleParserCheck" {
     try Testing.run(simpleParserCheck);
 }
 

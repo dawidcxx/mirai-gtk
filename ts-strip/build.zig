@@ -26,61 +26,28 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
-    const module_factory = ModuleFactory{
-        .b = b,
+    const test_step = b.step("test", "Run tests");
+
+    var module_factory = ModuleFactory.init(b, .{
         .tree_sitter_dep = tree_sitter,
         .tree_sitter_lib = typescript_grammar_lib,
         .optimize = optimize,
         .target = target,
-    };
-
-    const root_mod = module_factory.createModule("ts-strip", "./src/root.zig");
-    const root_mod_test = module_factory.createTest(root_mod);
-
-    const bundler_mod = module_factory.createModule("ts-strip/bundler", "./src/bundler.zig");
-    const bundler_mod_test = module_factory.createTest(bundler_mod);
-
-    const parser_mod = module_factory.createModule("ts-strip/parser", "./src/parser.zig");
-    const parser_mod_test = module_factory.createTest(parser_mod);
-
-    const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&bundler_mod_test.step);
-    test_step.dependOn(&root_mod_test.step);
-    test_step.dependOn(&parser_mod_test.step);
-
-    const test_parser_step = b.step("test-parser", "Run parser tests only");
-    test_parser_step.dependOn(&parser_mod_test.step);
-}
-
-const MkTestOptions = struct { mod: *std.Build.Module, target: std.Build.ResolvedTarget };
-
-fn mkTest(b: *std.Build, opts: MkTestOptions) *std.Build.Step.Run {
-    const compile = b.addTest(.{
-        .root_module = opts.mod,
-        .target = opts.target,
-        .optimize = .Debug,
+        .test_step = test_step,
     });
-    const runner = b.addRunArtifact(compile);
-    return runner;
+
+    _ = module_factory.add("ts-strip", "./src/root.zig");
+    _ = module_factory.add("ts-strip/bundler", "./src/bundler.zig");
+    _ = module_factory.add("ts-strip/parser", "./src/parser.zig");
 }
 
-const MkModuleOptions = struct {
-    name: []const u8,
-    src: std.Build.LazyPath,
+const ModuleFactoryOptions = struct {
     tree_sitter_dep: *std.Build.Dependency,
     tree_sitter_lib: *std.Build.Step.Compile,
-    target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
 };
-
-fn mkModule(b: *std.Build, opts: MkModuleOptions) *std.Build.Module {
-    const mod = b.addModule(opts.name, .{ .root_source_file = opts.src, .optimize = opts.optimize, .target = opts.target });
-
-    mod.addImport("tree-sitter", opts.tree_sitter_dep.module("tree-sitter"));
-    mod.linkLibrary(opts.tree_sitter_lib);
-
-    return mod;
-}
 
 const ModuleFactory = struct {
     b: *std.Build,
@@ -88,19 +55,49 @@ const ModuleFactory = struct {
     tree_sitter_lib: *std.Build.Step.Compile,
     optimize: std.builtin.OptimizeMode,
     target: std.Build.ResolvedTarget,
+    test_step: *std.Build.Step,
 
-    fn createModule(self: ModuleFactory, name: []const u8, src_path: []const u8) *std.Build.Module {
-        return mkModule(self.b, .{
-            .name = name,
-            .src = self.b.path(src_path),
-            .tree_sitter_dep = self.tree_sitter_dep,
-            .tree_sitter_lib = self.tree_sitter_lib,
+    pub fn init(b: *std.Build, opts: ModuleFactoryOptions) ModuleFactory {
+        return ModuleFactory{
+            .b = b,
+            .tree_sitter_dep = opts.tree_sitter_dep,
+            .tree_sitter_lib = opts.tree_sitter_lib,
+            .optimize = opts.optimize,
+            .target = opts.target,
+            .test_step = opts.test_step,
+        };
+    }
+
+    pub fn add(self: *ModuleFactory, name: []const u8, src_path: []const u8) *std.Build.Module {
+        const mod = self.createModule(name, src_path);
+        const test_runner = self.createTestForModule(mod, name);
+
+        self.test_step.dependOn(&test_runner.step);
+
+        const mod_test_step = self.b.step(name, self.b.fmt("Run {s} tests only", .{name}));
+        mod_test_step.dependOn(&test_runner.step);
+
+        return mod;
+    }
+
+    fn createTestForModule(self: *ModuleFactory, mod: *std.Build.Module, name: []const u8) *std.Build.Step.Run {
+        const compile = self.b.addTest(.{
+            .root_module = mod,
+            .target = self.target,
+            .optimize = .Debug,
+            .filter = name,
+        });
+        return self.b.addRunArtifact(compile);
+    }
+
+    fn createModule(self: *ModuleFactory, name: []const u8, src_path: []const u8) *std.Build.Module {
+        const mod = self.b.addModule(name, .{
+            .root_source_file = self.b.path(src_path),
             .optimize = self.optimize,
             .target = self.target,
         });
-    }
-
-    fn createTest(self: ModuleFactory, mod: *std.Build.Module) *std.Build.Step.Run {
-        return mkTest(self.b, .{ .mod = mod, .target = self.target });
+        mod.addImport("tree-sitter", self.tree_sitter_dep.module("tree-sitter"));
+        mod.linkLibrary(self.tree_sitter_lib);
+        return mod;
     }
 };

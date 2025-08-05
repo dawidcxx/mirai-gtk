@@ -77,8 +77,7 @@ fn collectModules(
     }
 }
 
-// tests
-test "run basicBundlerTest" {
+test "ts-strip/bundler basicBundlerTest" {
     try Testing.run(basicBundlerTest);
 }
 
