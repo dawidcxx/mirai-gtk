@@ -1,5 +1,6 @@
 const std = @import("std");
 const Testing = @import("./testing.zig");
+const util = @import("./util.zig");
 
 /// FsPath is a structured representation of a filesystem path
 /// For example:
@@ -32,6 +33,29 @@ pub fn isAbsolute(path: FsPath) bool {
 
 pub fn isRelative(path: FsPath) bool {
     return !path.absolute;
+}
+
+pub fn format(
+    self: FsPath,
+    comptime fmt: []const u8,
+    options: std.fmt.FormatOptions,
+    writer: anytype,
+) !void {
+    _ = fmt;
+    _ = options;
+    try writer.print("FsPath(", .{});
+    {
+        try writer.print("absolute='{s}' ", .{util.fmtBool(self.absolute)});
+        try writer.print("segments=[", .{});
+        for (self.segments, 0..) |segment, index| {
+            try writer.print("'{s}'", .{segment});
+            if (index != self.segments.len - 1) {
+                try writer.print(",", .{});
+            }
+        }
+        try writer.print("]", .{});
+    }
+    try writer.print(")", .{});
 }
 
 pub fn toString(self: FsPath, allocator: std.mem.Allocator) error{OutOfMemory}![]const u8 {
@@ -129,6 +153,12 @@ pub const Builder = struct {
 
     pub fn push(self: *Builder, alloc: std.mem.Allocator, segment: Segment) error{OutOfMemory}!void {
         try self.segments.append(alloc, segment);
+    }
+
+    pub fn pushPath(self: *Builder, alloc: std.mem.Allocator, path: FsPath) error{OutOfMemory}!void {
+        for (path.segments) |segment| {
+            try self.push(alloc, segment);
+        }
     }
 
     pub fn buildAbsolute(self: *Builder, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
@@ -271,7 +301,7 @@ fn validateRuntimePaths(t: *Testing) anyerror!void {
     const path = try builder.buildAbsolute(alloc);
     defer path.deinit(alloc);
 
-    const path_str = try path.toString(alloc);
+    const path_str = try std.fmt.allocPrint(alloc, "{s}", .{path});
     defer alloc.free(path_str);
-    try t.strEq("FsPath#Builder should construct the path as expected", path_str, "/home/dawid/notes.txt");
+    try t.strEq("FsPath#Builder should construct the path as expected", path_str, "FsPath(absolute='yes' segments=['home','dawid','notes.txt'])");
 }
