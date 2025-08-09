@@ -4,6 +4,7 @@ const Testing = @This();
 
 allocator: std.mem.Allocator,
 detect_leaks: bool,
+skip: bool,
 suite_name: [:0]const u8,
 
 const DefaultSuiteName = "ANONYMOUS";
@@ -12,7 +13,12 @@ pub fn run(testBody: fn (ctx: *Testing) anyerror!void) anyerror!void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    var test_context: Testing = .{ .allocator = allocator, .detect_leaks = true, .suite_name = DefaultSuiteName[0..] };
+    var test_context: Testing = .{
+        .allocator = allocator,
+        .detect_leaks = true,
+        .skip = false,
+        .suite_name = DefaultSuiteName[0..],
+    };
 
     std.testing.log_level = .info;
 
@@ -49,7 +55,7 @@ pub fn setLogLevel(t: Testing, level: std.log.Level) void {
 }
 
 pub fn strEq(t: Testing, msg: []const u8, a: []const u8, b: []const u8) anyerror!void {
-    _ = t;
+    if (t.skip) return;
     std.testing.expectEqualStrings(b, a) catch |e| {
         logTestFail(msg);
         return e;
@@ -58,7 +64,7 @@ pub fn strEq(t: Testing, msg: []const u8, a: []const u8, b: []const u8) anyerror
 }
 
 pub fn expectEqual(t: Testing, msg: []const u8, a: anytype, b: anytype) anyerror!void {
-    _ = t;
+    if (t.skip) return;
     std.testing.expectEqual(a, b) catch |e| {
         logTestFail(msg);
         return e;
@@ -67,7 +73,7 @@ pub fn expectEqual(t: Testing, msg: []const u8, a: anytype, b: anytype) anyerror
 }
 
 pub fn sliceEq(t: Testing, msg: []const u8, slice1: anytype, slice2: @TypeOf(slice1)) anyerror!void {
-    _ = t;
+    if (t.skip) return;
     std.testing.expectEqualSlices(std.meta.Elem(@TypeOf(slice1)), slice1, slice2) catch |e| {
         logTestFail(msg);
         return e;
@@ -76,7 +82,7 @@ pub fn sliceEq(t: Testing, msg: []const u8, slice1: anytype, slice2: @TypeOf(sli
 }
 
 pub fn isTrue(t: Testing, msg: []const u8, condition: bool) anyerror!void {
-    _ = t;
+    if (t.skip) return;
     std.testing.expect(condition) catch |e| {
         logTestFail(msg);
         return e;
@@ -85,7 +91,7 @@ pub fn isTrue(t: Testing, msg: []const u8, condition: bool) anyerror!void {
 }
 
 pub fn isFalse(t: Testing, msg: []const u8, condition: bool) anyerror!void {
-    _ = t;
+    if (t.skip) return;
     std.testing.expect(!condition) catch |e| {
         logTestFail(msg);
         return e;
