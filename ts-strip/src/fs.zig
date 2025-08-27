@@ -2,7 +2,7 @@ const std = @import("std");
 const posix = @import("std").posix;
 const builtin = @import("builtin");
 const Testing = @import("./testing.zig");
-const FsPath = @import("./FsPath.zig");
+const FsPath = @import("./FsPath.zig").FsPath;
 
 pub const FsError = error{ OutOfMemory, InvalidPath, IOError };
 
@@ -347,6 +347,16 @@ pub const VirtualFsNode = union(enum) {
         return root_node;
     }
 
+    pub fn getDepth(self: *VirtualFsNode) usize {
+        var depth: usize = 0;
+        var it: ?*VirtualFsNode = self;
+        while (it) |current_node| {
+            depth += 1;
+            it = current_node.parentNode();
+        }
+        return depth;
+    }
+
     pub fn isRoot(self: *VirtualFsNode) bool {
         return switch (self.*) {
             .File => false,
@@ -388,7 +398,7 @@ pub const VirtualFsNode = union(enum) {
     }
 
     pub fn getAbsolutePath(self: *VirtualFsNode, alloc: std.mem.Allocator) error{OutOfMemory}!FsPath {
-        var builder = try FsPath.Builder.initBackward(alloc);
+        var builder = try FsPath.Builder.initBackward(alloc, self.getDepth());
         try builder.push(alloc, self.name());
         var it: *VirtualFsNode = self;
         while (it.parentNode()) |current_node| {

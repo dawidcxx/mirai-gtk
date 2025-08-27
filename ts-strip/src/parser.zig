@@ -3,7 +3,7 @@ const ts = @import("tree-sitter");
 const builtin = @import("builtin");
 const Testing = @import("./testing.zig");
 const File = @import("./fs.zig").File;
-const FsPath = @import("./FsPath.zig");
+const FsPath = @import("./FsPath.zig").FsPath;
 
 extern fn tree_sitter_tsx() callconv(.C) *ts.Language;
 
@@ -52,7 +52,6 @@ pub const FileParser = struct {
     const CurrentParse = struct {
         tree: *ts.Tree,
         content: []const u8,
-        imports: ?*Imports,
     };
 
     ctx: *ParserContext,
@@ -76,10 +75,6 @@ pub const FileParser = struct {
     fn freeCurrentParse(self: *FileParser) void {
         if (self.current_parse) |parsed| {
             parsed.tree.destroy();
-            if (parsed.imports) |imports| {
-                imports.deinit();
-                self.ctx.allocator.destroy(imports);
-            }
             self.ctx.allocator.free(parsed.content);
             self.ctx.allocator.destroy(parsed);
             self.current_parse = null;
@@ -104,7 +99,6 @@ pub const FileParser = struct {
             next_parse.* = .{
                 .tree = tree,
                 .content = file_content,
-                .imports = null,
             };
             self.current_parse = next_parse;
         } else {
@@ -113,29 +107,69 @@ pub const FileParser = struct {
     }
 
     pub fn getReferencedImports(
-        self: *FileParser,
-    ) ParserErrors![]const Import {
-        if (self.current_parse) |current_parse| {
-            if (current_parse.imports) |imports| {
-                return imports.values();
+        self: FileParser,
+        allocator: std.mem.Allocator,
+    ) error{ParseError}!std.ArrayListUnmanaged(Import) {
+        const current_parse = blk: {
+            if (self.current_parse) |cp| {
+                break :blk cp;
+            } else {
+                @panic("Illegal state, tree must be parsed");
             }
-            const imports = try self.ctx.allocator.create(Imports);
-            imports.* = try .init(self.ctx.allocator, current_parse);
-            current_parse.imports = imports;
-            return imports.values();
-        } else {
-            @panic("Illegal state: file is not parsed");
-        }
+        };
+
+        var output_list = std.ArrayListUnmanaged(Import).initCapacity(allocator, 16) catch unreachable;
+
+        const GatherImports = struct {
+            output_list: *std.ArrayListUnmanaged(Import),
+            alloc: std.mem.Allocator,
+            cp: *FileParser.CurrentParse,
+
+            fn onNode(ctx: @This(), node: ts.Node) error{ParseError}!void {
+                if (std.mem.eql(u8, node.kind(), "import_statement")) {
+                    if (node.childByFieldName("source")) |src_node| {
+                        if (src_node.child(1)) |src_string_node| {
+                            const file_content = ctx.cp.content;
+                            // Obtain string node
+                            const start = src_string_node.startByte();
+                            const end = src_string_node.endByte();
+                            const len = end - start;
+                            const start_address: [*]const u8 = file_content.ptr + start;
+                            const str_slice = start_address[0..len];
+
+                            const import = Import{ .src = str_slice };
+
+                            ctx.output_list.append(ctx.alloc, import) catch unreachable;
+                        } else {
+                            std.log.err("Expected 'source' field to have a child at index 1, but it does not node={s}", .{src_node.kind()});
+                            return error.ParseError;
+                        }
+                    }
+                }
+            }
+        };
+
+        try walkTreeDfs2(
+            GatherImports,
+            .{
+                .output_list = &output_list,
+                .alloc = allocator,
+                .cp = current_parse,
+            },
+            current_parse,
+            &GatherImports.onNode,
+        );
+
+        return output_list;
     }
 };
 
-fn walk_tree_dfs(
-    Context: type,
-    ErrorSet: type,
-    context_ptr: *Context,
+fn walkTreeDfs2(
+    context_T: type,
+    context_instance: context_T,
     current_parse: *FileParser.CurrentParse,
-    on_node_callback: fn (ctx: *Context, current_parse: *FileParser.CurrentParse, node: ts.Node) ErrorSet!void,
-) ErrorSet!void {
+    on_node: *const fn (context: context_T, node: ts.Node) error{ParseError}!void,
+) error{ParseError}!void {
     var cursor = current_parse.tree.walk();
     defer cursor.destroy();
 
@@ -146,7 +180,7 @@ fn walk_tree_dfs(
             std.log.debug("walk_tree_dfs: {s} at depth {d}", .{ node.kind(), cursor.depth() });
         }
 
-        try on_node_callback(context_ptr, current_parse, node);
+        try on_node(context_instance, node);
 
         if (cursor.gotoFirstChild()) {
             continue;
@@ -167,50 +201,6 @@ fn walk_tree_dfs(
     }
 }
 
-pub const Imports = struct {
-    alloc: std.mem.Allocator,
-    list: std.ArrayListUnmanaged(Import),
-
-    pub fn init(alloc: std.mem.Allocator, current_parse: *FileParser.CurrentParse) error{ OutOfMemory, ParseError }!Imports {
-        const import_list = try std.ArrayListUnmanaged(Import).initCapacity(alloc, 8);
-        var instance: Imports = .{ .list = import_list, .alloc = alloc };
-        try walk_tree_dfs(Imports, error{ OutOfMemory, ParseError }, &instance, current_parse, Imports.appendReferencedImport);
-        return instance;
-    }
-
-    pub fn values(self: *const Imports) []const Import {
-        return self.list.items;
-    }
-
-    pub fn deinit(self: *Imports) void {
-        self.list.deinit(self.alloc);
-    }
-
-    fn appendReferencedImport(self: *Imports, current_parse: *FileParser.CurrentParse, node: ts.Node) error{ OutOfMemory, ParseError }!void {
-        if (std.mem.eql(u8, node.kind(), "import_statement")) {
-            if (node.childByFieldName("source")) |src_node| {
-                if (src_node.child(1)) |src_string_node| {
-                    const file_content = current_parse.content;
-                    // Obtain string node
-                    const start = src_string_node.startByte();
-                    const end = src_string_node.endByte();
-                    const len = end - start;
-                    const start_address: [*]const u8 = file_content.ptr + start;
-                    const str_slice = start_address[0..len];
-                    std.log.debug("Found import_statement: '{s}'", .{str_slice});
-                    const import = Import{ .src = str_slice };
-                    self.list.append(self.alloc, import) catch {
-                        return error.OutOfMemory;
-                    };
-                } else {
-                    std.log.err("Expected 'source' field to have a child at index 1, but it does not node={s}", .{src_node.kind()});
-                    return error.ParseError;
-                }
-            }
-        }
-    }
-};
-
 pub const Import = struct {
     src: []const u8,
 
@@ -219,7 +209,7 @@ pub const Import = struct {
     }
 
     pub fn toPath(self: Import, allocator: std.mem.Allocator) error{OutOfMemory}!FsPath {
-        return FsPath.fromString(self.src, allocator);
+        return FsPath.fromString(allocator, self.src);
     }
 };
 
@@ -227,13 +217,14 @@ test "ts-strip/parser simpleParserCheck" {
     try Testing.run(simpleParserCheck);
 }
 
-fn simpleParserCheck(testing: *Testing) anyerror!void {
+fn simpleParserCheck(t: *Testing) anyerror!void {
     const Fs = @import("./fs.zig").VirtualFs;
 
-    testing.register(@src());
-    testing.setLogLevel(.info);
+    t.register(@src());
+    t.setLogLevel(.info);
+    // t.detect_leaks = true;
 
-    var fs = try Fs.init(testing.allocator);
+    var fs = try Fs.init(t.allocator);
     defer fs.deinit();
 
     try fs.mkDir(FsPath.static("/test-dir"));
@@ -250,7 +241,7 @@ fn simpleParserCheck(testing: *Testing) anyerror!void {
     ;
     try test_file.writeAll(file_content[0..]);
 
-    var ctx: ParserContext = try .init(testing.allocator);
+    var ctx: ParserContext = try .init(t.allocator);
     defer ctx.deinit();
 
     var file_parser: *FileParser = try ctx.forFile(test_file);
@@ -258,6 +249,8 @@ fn simpleParserCheck(testing: *Testing) anyerror!void {
 
     try file_parser.parse();
 
-    const imports = try file_parser.getReferencedImports();
-    try testing.expectEqual("Import count should be 3", imports.len, 3);
+    var imports = try file_parser.getReferencedImports(t.allocator);
+    defer imports.deinit(t.allocator);
+
+    try t.expectEqual("Import count should be 3", imports.items.len, 3);
 }

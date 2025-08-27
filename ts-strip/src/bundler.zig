@@ -4,7 +4,7 @@ const ParserContext = @import("./parser.zig").ParserContext;
 const FileParser = @import("./parser.zig").FileParser;
 const Import = @import("./parser.zig").Import;
 const Fs = @import("./fs.zig");
-const FsPath = @import("./FsPath.zig");
+const FsPath = @import("./FsPath.zig").FsPath;
 const FileSystem = Fs.FileSystem;
 
 const ModuleMap = std.ArrayHashMapUnmanaged(FsPath, *FileParser, FsPath.Hash, true);
@@ -58,16 +58,19 @@ fn collectModules(
         std.log.debug("module for file='{s}' parsed into source set", .{file_parser.file.toString()});
         return;
     } else {
+        std.log.err("opening '{s}'", .{absolute_fs_path});
         const file = try fs.open(absolute_fs_path);
+
         const absolute_path = (try file.realpath()).parentDir();
         const parser = try parser_ctx.forFile(file);
         try parser.parse();
         try module_map.put(alloc, absolute_path, parser);
-        const imports = try parser.getReferencedImports();
-        for (imports) |import| {
+        const imports = try parser.getReferencedImports(alloc);
+
+        for (imports.items) |import| {
             if (import.isRelative()) {
                 const import_path = try import.toPath(alloc);
-                std.log.info("Resolving relative import '{s}' against '{s}'", .{ try import_path.toString(alloc), try absolute_path.toString(alloc) });
+                std.log.info("Resolving relative import '{s}' against '{s}'", .{ import_path, absolute_path });
                 const resolved_path = try fs.resolveRelative(alloc, absolute_path, import_path);
                 try collectModules(alloc, fs, parser_ctx, module_map, resolved_path);
             } else {
@@ -83,7 +86,7 @@ test "ts-strip/bundler basicBundlerTest" {
 
 fn basicBundlerTest(t: *Testing) anyerror!void {
     t.register(@src());
-    t.skip = true;
+    t.setLogLevel(.err);
 
     // Fixtures: begin
     const FILES: []const FsPath = &[_]FsPath{ FsPath.static("/main.ts"), FsPath.static("/math.ts") };
@@ -107,9 +110,7 @@ fn basicBundlerTest(t: *Testing) anyerror!void {
     }
 
     const output_path = FsPath.static("/bundle.out.js");
-    bundler.bundle(FsPath.static("/main.ts"), output_path) catch {
-        return;
-    };
+    try bundler.bundle(FsPath.static("/main.ts"), output_path);
 
     var output_file = try fs.open(output_path);
     defer output_file.close();
@@ -121,5 +122,5 @@ fn basicBundlerTest(t: *Testing) anyerror!void {
         \\ console.log(add(2, 3));\n
     ;
 
-    _ = t.strEq("Should bundle as expected", output_content, expected_output[0..]) catch {};
+    try t.strEq("Should bundle as expected", output_content, expected_output[0..]);
 }
